@@ -1,0 +1,1 @@
+"""Rubika ticket-category bot."""
