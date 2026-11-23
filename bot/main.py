@@ -47,12 +47,14 @@ def extract_file_message(update: dict, settings: Settings):
 def handle(client, settings, categorizer, chat_id, message_id, file_id, name):
     log.info("processing %s in %s", name, chat_id)
     data = client.download_file(file_id)
-    png, caption, xlsx = build_report(data, settings, categorizer)
-    client.send_file(chat_id, png, "ticket_categories.png", kind="Image", caption=caption,
+    rep = build_report(data, settings, categorizer)
+    client.send_file(chat_id, rep.png, "ticket_categories.png", kind="Image", caption=rep.caption,
                      reply_to=message_id)
     if settings.send_xlsx:
-        client.send_file(chat_id, xlsx, f"categorized_{name}", kind="File",
-                         caption="فایل دسته‌بندی‌شده (بدون ستون شماره موبایل)")
+        client.send_file(chat_id, rep.xlsx, f"Analyzed_{name}", kind="File",
+                         caption="فایل تحلیل‌شده: ستون Category + شیت Summerty (بدون ستون شماره موبایل)")
+    for text in rep.messages:  # removed tickets, borderline / duplicates
+        client.send_message(chat_id, text)
 
 
 def run(once: bool = False):

@@ -26,4 +26,6 @@ class Settings:
     state_file: Path = Path(os.getenv("STATE_FILE", str(ROOT / "data" / "state.json")))
     font_regular: Path = ROOT / "fonts" / "Vazirmatn-Regular.ttf"
     font_bold: Path = ROOT / "fonts" / "Vazirmatn-Bold.ttf"
-    min_confidence: float = float(os.getenv("MIN_CONFIDENCE", "0.30"))
+    min_confidence: float = float(os.getenv("MIN_CONFIDENCE", "0.30"))        # below -> «نیازمند تصمیم»
+    borderline_confidence: float = float(os.getenv("BORDERLINE_CONFIDENCE", "0.50"))
+    borderline_margin: float = float(os.getenv("BORDERLINE_MARGIN", "0.15"))   # top1 - top2 below -> borderline

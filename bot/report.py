@@ -1,41 +1,113 @@
-"""Excel cleaning + summary table + PNG rendering (Persian, RTL)."""
+"""Prompt-driven analysis -> categorized Excel (+ Summerty sheet), PNG summary table and chat messages."""
 from __future__ import annotations
 
 import io
+from copy import copy
 import re
-from datetime import datetime
+from dataclasses import dataclass, field
 
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from PIL import Image, ImageDraw, ImageFont
 
-from .categorizer import CATEGORIES, TicketCategorizer
+from .categorizer import CATEGORIES, NEEDS_DECISION, TicketCategorizer, build_text
 from .config import Settings
 from .persian import JALALI_MONTHS, fa_digits, normalize, rtl
+from .rules import check_exclusion, hard_category
 
 _PHONE = re.compile(r"(?<!\d)(?:\+?98|0)?9\d{9}(?!\d)")
+_PACKAGE_PATH = re.compile(r"^\[6\]\s*بسته ها\s*>\s*\[6-8\]")
+OUT_OF_SCOPE = "خارج از تحلیل"
+F_TYPE, F_PKG, F_TEXT, F_SERVICE = "نوع مشکل تایپ", "نام بسته", "محتوای خدمات", "نوع درخواست خدمات"
+NAVY = "1F3864"
 
 
-def clean_excel(data: bytes, settings: Settings) -> pd.DataFrame:
-    """Read the workbook, drop the mobile-number column(s) and mask phone numbers in free text."""
-    df = pd.read_excel(io.BytesIO(data))
-    df.columns = [str(c).strip() for c in df.columns]
-    drop = [c for c in df.columns if normalize(c) in {normalize(x) for x in settings.drop_columns}]
-    df = df.drop(columns=drop)
-    for col in df.columns:
-        if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
-            df[col] = df[col].map(lambda v: _PHONE.sub("[شماره حذف شد]", v) if isinstance(v, str) else v)
-    return df
+@dataclass
+class RowResult:
+    excel_row: int
+    ticket: str = ""
+    package: bool = True          # row belongs to «مشکلات بسته»
+    excluded: bool = False
+    reason: str = ""
+    rule: int = 0
+    type_only: bool = False       # excluded only because of the unreliable type column
+    category: str = ""
+    conf: float = 1.0
+    second: str = ""
+    second_conf: float = 0.0
+    note: str = ""                # borderline / duplicate explanation
 
 
-def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    counts = df["دسته‌بندی"].value_counts()
-    rows = [(c, int(counts.get(c, 0))) for c in CATEGORIES if counts.get(c, 0) > 0]
-    rows.sort(key=lambda r: (-r[1], CATEGORIES.index(r[0])))
-    if (o := [r for r in rows if r[0] == CATEGORIES[-1]]):
-        rows = [r for r in rows if r[0] != CATEGORIES[-1]] + o
+@dataclass
+class Report:
+    png: bytes
+    caption: str
+    messages: list = field(default_factory=list)
+    xlsx: bytes = b""
+    summary: pd.DataFrame | None = None
+    results: list = field(default_factory=list)
+
+
+def _cell(v):
+    return "" if v is None or (isinstance(v, float) and v != v) else str(v)
+
+
+def analyze(df: pd.DataFrame, categorizer: TicketCategorizer, settings: Settings) -> list[RowResult]:
+    """df row i  <->  Excel row i + 2. Implements steps 1-2 of the analysis prompt."""
+    results, pending, seen = [], [], {}
+    has_service = F_SERVICE in df.columns
+    for i, rec in enumerate(df.to_dict("records")):
+        r = RowResult(excel_row=i + 2, ticket=_cell(rec.get("شماره تیکت")))
+        svc = normalize(_cell(rec.get(F_SERVICE)))
+        r.package = bool(_PACKAGE_PATH.match(svc)) if has_service else True
+        results.append(r)
+        if not r.package:
+            continue
+        content, pkg, typ = _cell(rec.get(F_TEXT)), _cell(rec.get(F_PKG)), _cell(rec.get(F_TYPE))
+        text = build_text(content, pkg)
+        ex = check_exclusion(content, typ, has_category_hint=" hint_" in text)
+        if ex:
+            r.excluded = True
+            r.rule, r.reason, r.type_only = ex
+        else:
+            hc = hard_category(content, pkg)
+            if hc:
+                r.category = hc
+            else:
+                pending.append((r, text))
+        key = normalize(content)
+        if len(key) > 15:
+            seen.setdefault(key, []).append(r.excel_row)
+    preds = categorizer.predict([t for _, t in pending])
+    for (r, _), p in zip(pending, preds):
+        r.category, r.conf, r.second, r.second_conf = p["label"], p["conf"], p["second"], p["second_conf"]
+        if r.conf < settings.min_confidence:
+            r.note = f"اطمینان پایین؛ نزدیک به «{r.category}» ({fa_digits(f'{r.conf:.0%}')}) و «{r.second}» ({fa_digits(f'{r.second_conf:.0%}')})"
+            r.category = NEEDS_DECISION
+        elif r.conf < settings.borderline_confidence or r.conf - r.second_conf < settings.borderline_margin:
+            r.note = f"انتخاب «{r.category}» ({fa_digits(f'{r.conf:.0%}')}) ولی نزدیک به «{r.second}» ({fa_digits(f'{r.second_conf:.0%}')})"
+    by_row = {r.excel_row: r for r in results}
+    for rows in seen.values():
+        if len(rows) > 1:
+            for x in rows:
+                others = "، ".join(fa_digits(y) for y in rows if y != x)
+                by_row[x].note = (by_row[x].note + " | " if by_row[x].note else "") + f"تکراری با ردیف {others}"
+    return results
+
+
+def summarize(results: list[RowResult]) -> pd.DataFrame:
+    counts = {}
+    for r in results:
+        if r.package and not r.excluded:
+            counts[r.category] = counts.get(r.category, 0) + 1
+    order = CATEGORIES + [NEEDS_DECISION]
+    rows = [(c, counts[c]) for c in order if counts.get(c)]
+    rows.sort(key=lambda x: (x[0] == NEEDS_DECISION, -x[1], order.index(x[0])))
     total = sum(n for _, n in rows) or 1
-    return pd.DataFrame({"دسته مشکل": [r[0] for r in rows], "تعداد تیکت": [r[1] for r in rows],
-                         "درصد": [r[1] * 100 / total for r in rows]})
+    return pd.DataFrame({"دسته مشکل": [c for c, _ in rows], "تعداد تیکت": [n for _, n in rows],
+                         "درصد": [n * 100 / total for _, n in rows]})
 
 
 def report_title(df: pd.DataFrame) -> str:
@@ -127,23 +199,146 @@ def render_png(summary: pd.DataFrame, title: str, settings: Settings) -> bytes:
     return buf.getvalue()
 
 
-def caption(summary: pd.DataFrame, title: str) -> str:
+def _path_parts(svc: str):
+    parts = [re.sub(r"^\[[\d\-]+\]\s*", "", p.strip()) for p in normalize(svc).split(">")]
+    return (parts[0] if parts else ""), (parts[-1] if parts else "")
+
+
+def build_workbook(data: bytes, results: list[RowResult], summary: pd.DataFrame, settings: Settings) -> bytes:
+    """Edits the original workbook: drops mobile column + out-of-scope rows, adds Category, adds Summerty."""
+    wb = load_workbook(io.BytesIO(data))
+    ws = wb.worksheets[0]
+    full_mode = any(not r.package for r in results)
+
+    # 1) mask phone numbers inside free text
+    for row in ws.iter_rows(min_row=2):
+        for c in row:
+            if isinstance(c.value, str) and _PHONE.search(c.value):
+                c.value = _PHONE.sub("[شماره حذف شد]", c.value)
+    # 2) drop mobile column(s)
+    drop = {normalize(x) for x in settings.drop_columns}
+    for idx in sorted((c.column for c in ws[1] if normalize(c.value) in drop), reverse=True):
+        ws.delete_cols(idx)
+    # 3) Category (+ full-mode columns) appended at the end
+    hdr = {normalize(c.value): c.column for c in ws[1] if c.value is not None}
+    last = ws.max_column
+    new_cols = ["Category"] + (["نوع خدمت", "زیردسته"] if full_mode else [])
+    for k, name in enumerate(new_cols, start=1):
+        cell = ws.cell(row=1, column=last + k, value=name)
+        src = ws.cell(row=1, column=last)
+        cell.font, cell.fill, cell.alignment, cell.border = copy(src.font), copy(src.fill), copy(src.alignment), copy(src.border)
+        ws.column_dimensions[get_column_letter(last + k)].width = 28
+    cat_col = last + 1
+    svc_col = hdr.get(normalize(F_SERVICE))
+    # shifted column index after deleting mobile col
+    if svc_col:
+        svc_col = [c.column for c in ws[1] if normalize(c.value) == normalize(F_SERVICE)][0]
+    for r in results:
+        if r.package:
+            ws.cell(row=r.excel_row, column=cat_col, value=OUT_OF_SCOPE if r.excluded else r.category)
+        if full_mode:
+            svc = _cell(ws.cell(row=r.excel_row, column=svc_col).value) if svc_col else ""
+            top, leaf = _path_parts(svc)
+            ws.cell(row=r.excel_row, column=cat_col + 1, value=top)
+            ws.cell(row=r.excel_row, column=cat_col + 2,
+                    value=(OUT_OF_SCOPE if r.excluded else r.category) if r.package else leaf)
+    # 4) normal mode: remove excluded rows (bottom-up so numbers stay valid)
+    if not full_mode:
+        for r in sorted((x for x in results if x.excluded), key=lambda x: -x.excel_row):
+            ws.delete_rows(r.excel_row)
+
+    # 5) Summerty sheet
+    sm = wb.create_sheet("Summerty")
+    sm.sheet_view.rightToLeft = True
+    cat_letter = get_column_letter(cat_col)
+    last_row = max(ws.max_row, 2)
+    rng = f"'{ws.title}'!${cat_letter}$2:${cat_letter}${last_row}"
+    nz = "B Nazanin"
+    head_font = Font(name=nz, size=12, bold=True, color="FFFFFF")
+    body_font = Font(name=nz, size=12)
+    bold_font = Font(name=nz, size=12, bold=True)
+    for j, h in enumerate(["دسته مشکل", "تعداد تیکت", "درصد از کل"], start=1):
+        c = sm.cell(row=1, column=j, value=h)
+        c.font, c.fill = head_font, PatternFill("solid", fgColor=NAVY)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    n = len(summary)
+    tot_row = n + 2
+    for i, cat in enumerate(summary["دسته مشکل"], start=2):
+        sm.cell(row=i, column=1, value=cat)
+        sm.cell(row=i, column=2, value=f"=COUNTIF({rng},A{i})")
+        sm.cell(row=i, column=3, value=f"=IF($B${tot_row}=0,0,B{i}/$B${tot_row})").number_format = "0.0%"
+        for j in (1, 2, 3):
+            c = sm.cell(row=i, column=j)
+            c.font = body_font
+            c.alignment = Alignment(horizontal="right" if j == 1 else "center")
+            if i % 2 == 1:
+                c.fill = PatternFill("solid", fgColor="DCE6F1")
+    sm.cell(row=tot_row, column=1, value="جمع کل")
+    sm.cell(row=tot_row, column=2, value=f"=SUM(B2:B{tot_row - 1})")
+    sm.cell(row=tot_row, column=3, value=f"=SUM(C2:C{tot_row - 1})").number_format = "0.0%"
+    ctl = tot_row + 1
+    sm.cell(row=ctl, column=1, value="کنترل (جمع جدول = تعداد تیکت‌های تحلیل‌شده شیت)")
+    sm.cell(row=ctl, column=2,
+            value=f'=IF(B{tot_row}=COUNTA({rng})-COUNTIF({rng},"{OUT_OF_SCOPE}"),"OK","مغایرت")')
+    for rr in (tot_row, ctl):
+        for j in (1, 2, 3):
+            c = sm.cell(row=rr, column=j)
+            c.font = bold_font
+            c.alignment = Alignment(horizontal="right" if j == 1 else "center")
+            if rr == tot_row:
+                c.fill = PatternFill("solid", fgColor="BDD0EA")
+    sm.column_dimensions["A"].width = 46
+    sm.column_dimensions["B"].width = 16
+    sm.column_dimensions["C"].width = 16
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _chunks(lines: list[str], limit: int = 3300) -> list[str]:
+    out, cur = [], ""
+    for ln in lines:
+        if cur and len(cur) + len(ln) + 1 > limit:
+            out.append(cur)
+            cur = ""
+        cur += ("\n" if cur else "") + ln
+    if cur:
+        out.append(cur)
+    return out
+
+
+def build_messages(results: list[RowResult], summary: pd.DataFrame, title: str) -> tuple[str, list[str]]:
+    kept = [r for r in results if r.package and not r.excluded]
+    removed = [r for r in results if r.package and r.excluded]
     lines = [title, ""]
     for r in summary.itertuples(index=False):
         lines.append(f"• {r[0]}: {fa_digits(r[1])} ({fa_digits(f'{r[2]:.1f}')}٪)")
-    lines += ["", f"جمع کل: {fa_digits(int(summary['تعداد تیکت'].sum()))} تیکت"]
-    return "\n".join(lines)
+    lines += ["", f"جمع کل: {fa_digits(len(kept))} تیکت | حذف‌شده: {fa_digits(len(removed))} تیکت"]
+    caption = "\n".join(lines)
+
+    msgs = []
+    if removed:
+        ls = [f"🗑 تیکت‌های حذف‌شده از تحلیل ({fa_digits(len(removed))}):"]
+        for r in removed:
+            extra = " (فقط بر اساس نوع مشکل؛ متن شکایت مشخص دارد)" if r.type_only else ""
+            ls.append(f"• ردیف {fa_digits(r.excel_row)} | قاعده {fa_digits(r.rule)}: {r.reason}{extra}")
+        msgs += _chunks(ls)
+    border = [r for r in kept if r.note]
+    if border:
+        ls = [f"⚠️ تیکت‌های مرزی / نیازمند تصمیم / تکراری ({fa_digits(len(border))}):"]
+        for r in border:
+            ls.append(f"• ردیف {fa_digits(r.excel_row)} ← {r.category}: {r.note}")
+        msgs += _chunks(ls)
+    return caption, msgs
 
 
-def build_report(data: bytes, settings: Settings, categorizer: TicketCategorizer):
-    """Returns (png_bytes, caption_text, categorized_xlsx_bytes)."""
-    df = clean_excel(data, settings)
-    df = categorizer.categorize_df(df)
-    summary = summarize(df)
+def build_report(data: bytes, settings: Settings, categorizer: TicketCategorizer) -> Report:
+    df = pd.read_excel(io.BytesIO(data))
+    df.columns = [str(c).strip() for c in df.columns]
+    results = analyze(df, categorizer, settings)
+    summary = summarize(results)
     title = report_title(df)
     png = render_png(summary, title, settings)
-    xbuf = io.BytesIO()
-    with pd.ExcelWriter(xbuf, engine="openpyxl") as xw:
-        df.to_excel(xw, index=False, sheet_name="تیکت‌ها")
-        summary.rename(columns={"درصد": "درصد از کل"}).to_excel(xw, index=False, sheet_name="خلاصه")
-    return png, caption(summary, title), xbuf.getvalue()
+    caption, msgs = build_messages(results, summary, title)
+    xlsx = build_workbook(data, results, summary, settings)
+    return Report(png=png, caption=caption, messages=msgs, xlsx=xlsx, summary=summary, results=results)
